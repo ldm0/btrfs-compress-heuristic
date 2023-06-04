@@ -1,57 +1,38 @@
 //! Fast and heuristically detects whether content is compressible.
+mod error;
+
+use crate::error::UncompressedError;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
-use thiserror::Error;
-
-/// Why we assume provided file is uncompressed.
-#[derive(Error, Debug)]
-pub enum UncompressedError {
-    #[error("IoError({0:?})")]
-    IoError(#[from] std::io::Error),
-    /// Repeated bytes(usually zero-filled).
-    #[error("Repeated bytes")]
-    RepeatedBytes,
-    /// This file has little variants(mostly ascii texts)
-    #[error("Little byte variants: {0}")]
-    LittleVariant(usize),
-    /// A small set of bytes make up 90% of the sample.
-    #[error("Small byte core set: {0}")]
-    SmallCoreSet(usize),
-    /// Low shannon entropy.
-    #[error("Low shannon entropy: {0}")]
-    LowEntropy(usize),
-}
-
 struct Samples {
-    samples: Vec<u8>,
+    samples: Box<[u8]>,
 }
 
 impl Samples {
-    const SAMPLING_READ_SIZE: usize = 16;
-    const SAMPLING_INTERVAL: usize = 256;
-    const MAX_SAMPLE_COUNT: usize = 512;
-    fn sample<R: Read + Seek>(content: &mut BufReader<R>) -> std::io::Result<Self> {
-        use std::io::ErrorKind;
-        let mut samples = Vec::new();
-        let mut sample_buffer = [0u8; Self::SAMPLING_READ_SIZE];
+    fn collect<R: Read + Seek>(content: &mut R) -> std::io::Result<Self> {
+        const SAMPLING_READ_SIZE: usize = 16;
+        const SAMPLING_INTERVAL: i64 = 256;
+        const BTRFS_MAX_UNCOMPRESSED: u64 = 128 * 1024;
+        const MAX_SAMPLE_COUNT: usize =
+            (BTRFS_MAX_UNCOMPRESSED / SAMPLING_INTERVAL as u64) as usize;
 
-        for _ in 0..Self::MAX_SAMPLE_COUNT {
-            let result = content.read_exact(&mut sample_buffer);
-            match result {
-                Ok(()) => {
-                    samples.extend_from_slice(&sample_buffer);
-                }
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                    break;
-                }
+        use std::io::ErrorKind;
+
+        let mut samples = Vec::with_capacity(MAX_SAMPLE_COUNT * SAMPLING_READ_SIZE);
+        let mut buffer = [0u8; SAMPLING_READ_SIZE];
+
+        for _ in 0..MAX_SAMPLE_COUNT {
+            match content.read_exact(&mut buffer) {
+                Ok(()) => samples.extend_from_slice(&buffer),
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
-            content.seek_relative(Self::SAMPLING_INTERVAL as i64)?;
+            content.seek(SeekFrom::Current(SAMPLING_INTERVAL))?;
         }
 
-        debug_assert_eq!(samples.len() % Self::SAMPLING_READ_SIZE, 0);
-
-        Ok(Samples { samples })
+        Ok(Samples {
+            samples: samples.into_boxed_slice(),
+        })
     }
 
     fn check_repeated_bytes(&self) -> bool {
@@ -59,8 +40,8 @@ impl Samples {
         &self.samples[..len] == &self.samples[len..len * 2]
     }
 
-    fn word_bucket(&self) -> [usize; 0x100] {
-        let mut bucket = [0usize; 0x100];
+    fn word_bucket(&self) -> [usize; 256] {
+        let mut bucket = [0usize; 256];
         for &sample in self.samples.iter() {
             bucket[sample as usize] += 1;
         }
@@ -69,42 +50,42 @@ impl Samples {
 }
 
 /// How many byte variants occurred.
-fn num_variant(word_bucket: &[usize; 0x100]) -> usize {
+fn byte_set_size(word_bucket: &[usize; 256]) -> usize {
     word_bucket.iter().filter(|&&x| x > 0).count()
 }
 
 /// How many byte variants make up 90% of the sample.
-fn num_core_set(sorted_word_bucket: &[usize; 0x100], sample_size: usize) -> usize {
+fn byte_core_set_size(sorted_word_bucket: &[usize; 256], sample_size: usize) -> usize {
     let threshold = sample_size * 9 / 10;
     let mut core_set_num = 0;
     for (i, &count) in sorted_word_bucket.iter().enumerate() {
-        if core_set_num >= threshold {
+        core_set_num += count;
+        if core_set_num > threshold {
             return i;
         }
-        core_set_num += count;
     }
-    0x100
-}
-
-fn log2_pow4(x: usize) -> u32 {
-    fn log2(x: usize) -> u32 {
-        usize::BITS.wrapping_sub(x.leading_zeros()).wrapping_sub(1)
-    }
-
-    log2(x * x * x * x)
+    256
 }
 
 fn shannon_entropy(sorted_word_bucket: &[usize; 0x100], sample_size: usize) -> usize {
+    fn log2_pow4(x: usize) -> u32 {
+        fn log2(x: usize) -> u32 {
+            usize::BITS
+                .wrapping_sub(x.leading_zeros())
+                .saturating_sub(1)
+        }
+        log2(x * x * x * x)
+    }
     let entropy_max = 8 * log2_pow4(2);
     let mut entropy_sum = 0;
-    let base = log2_pow4(sample_size);
-    for &count in sorted_word_bucket {
+    let sz_base = log2_pow4(sample_size);
+    for &p in sorted_word_bucket {
         // We can early exit here since word bucket is reversely sorted.
-        if count == 0 {
+        if p == 0 {
             break;
         }
-        let logp = log2_pow4(count);
-        entropy_sum += count * (base - logp) as usize;
+        let p_base = log2_pow4(p);
+        entropy_sum += p * (sz_base - p_base) as usize;
     }
     entropy_sum /= sample_size;
     entropy_sum * 100 / entropy_max as usize
@@ -116,7 +97,7 @@ pub fn compressed<R: Read + Seek>(content: &mut BufReader<R>) -> Result<(), Unco
     const BYTE_CORE_SET_HIGH: usize = 200;
     const ENTROPY_LVL_HIGH: usize = 80;
 
-    let samples = Samples::sample(content)?;
+    let samples = Samples::collect(content)?;
 
     if samples.check_repeated_bytes() {
         return Err(UncompressedError::RepeatedBytes);
@@ -124,20 +105,20 @@ pub fn compressed<R: Read + Seek>(content: &mut BufReader<R>) -> Result<(), Unco
 
     let word_bucket = samples.word_bucket();
 
-    let num_variants = num_variant(&word_bucket);
-    if num_variants < WORD_VARIANT_THRESHOLD {
-        return Err(UncompressedError::LittleVariant(num_variants));
+    let byte_set_size = byte_set_size(&word_bucket);
+    if byte_set_size < WORD_VARIANT_THRESHOLD {
+        return Err(UncompressedError::LittleVariant(byte_set_size));
     }
 
     let mut sorted_word_bucket = word_bucket;
     sorted_word_bucket.sort_by(|a, b| b.cmp(a));
     let sample_size = samples.samples.len();
 
-    let num_core_set = num_core_set(&sorted_word_bucket, sample_size);
-    if num_core_set <= BYTE_CORE_SET_LOW {
-        return Err(UncompressedError::SmallCoreSet(num_core_set));
+    let core_set_size = byte_core_set_size(&sorted_word_bucket, sample_size);
+    if core_set_size <= BYTE_CORE_SET_LOW {
+        return Err(UncompressedError::SmallCoreSet(core_set_size));
     }
-    if num_core_set >= BYTE_CORE_SET_HIGH {
+    if core_set_size >= BYTE_CORE_SET_HIGH {
         return Ok(());
     }
 
@@ -242,8 +223,8 @@ mod tests {
 
     #[test]
     fn test_random() {
-        let mostly_ascii_text: Vec<u8> = (0..0x10000).map(|_| rand::random::<u8>()).collect();
-        let mut reader = BufReader::new(Cursor::new(mostly_ascii_text));
+        let random: Vec<u8> = (0..0x10000).map(|_| rand::random::<u8>()).collect();
+        let mut reader = BufReader::new(Cursor::new(random));
         assert!(matches!(compressed(&mut reader), Ok(())));
     }
 }
