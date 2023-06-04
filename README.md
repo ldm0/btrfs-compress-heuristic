@@ -1,3 +1,3 @@
 BTRFS's heuristic compressible detection
 
-Ported from btrfs: https://github.com/torvalds/linux/blob/f289811258552a8a8c15d2446f9ead1d567357f2/fs/btrfs/compression.c
+Ported from btrfs: https://github.com/torvalds/linux/blob/6f64a5ebe1dc64add6e1d8ed3113200909988c02/fs/btrfs/compression.c#LL1376C18-L1376C18
