@@ -37,7 +37,7 @@ impl Samples {
 
     fn check_repeated_bytes(&self) -> bool {
         let len = self.samples.len() / 2;
-        &self.samples[..len] == &self.samples[len..len * 2]
+        self.samples[..len] == self.samples[len..len * 2]
     }
 
     fn word_bucket(&self) -> [usize; 256] {
